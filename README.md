@@ -144,6 +144,10 @@ SheepTool/
 └── data/              # 运行时数据（不纳入版本控制）
 ```
 
+## 参考项目
+
+- 求解算法核心参考自 [NB-Dragon/SheepSolver](https://github.com/NB-Dragon/SheepSolver)
+
 ## 注意事项
 
 - 本工具仅供学习与技术研究使用
