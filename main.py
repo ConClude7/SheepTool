@@ -64,22 +64,12 @@ def load_config() -> dict:
 def read_api_json(args) -> dict:
     """从多种来源读取 API 响应，返回解析后的 dict。
 
-    优先级：--json > --file > --captured > 交互式粘贴
+    优先级：--json > --file > 交互式粘贴
     """
     if getattr(args, "json", None):
         raw = args.json
     elif getattr(args, "file", None):
         raw = Path(args.file).read_text(encoding="utf-8")
-    elif getattr(args, "captured", False):
-        # 读 mitmproxy 自动写入的捕获文件，完全避开终端粘贴问题
-        cap_file = DATA_DIR / "captured.json"
-        if not cap_file.exists():
-            raise FileNotFoundError(
-                f"未找到捕获文件 {cap_file}，请先通过代理拦截一次游戏请求。"
-            )
-        captured = json.loads(cap_file.read_text(encoding="utf-8"))
-        # captured.json 已经是提取好的字段，直接构造返回值
-        return _build_api_data(captured, captured)
     else:
         raw = _paste_json_interactively()
 
@@ -131,12 +121,9 @@ def _paste_json_interactively() -> str:
     提示：如果粘贴始终出错，建议改用文件方式：
       1. 将 JSON 保存到 api.json
       2. python main.py run --file api.json
-    或使用代理自动捕获后执行：
-      python main.py run --captured
     """
     print("请粘贴 API 响应 JSON，粘贴完成后按 Ctrl+D（macOS/Linux）结束输入：")
     print("  提示：若粘贴失败，请改用  python main.py run --file <api.json>")
-    print("        或代理拦截后使用  python main.py run --captured")
     try:
         return sys.stdin.read()
     except KeyboardInterrupt:
@@ -327,9 +314,6 @@ def build_parser() -> argparse.ArgumentParser:
   # 首次校准（把微信调到游戏界面再运行）
   python main.py calibrate
 
-  # 代理拦截后自动读取（推荐，无需手动粘贴）
-  python main.py run --captured
-
   # 将 JSON 保存到文件再读取（match_data 含特殊字符时推荐）
   python main.py run --file api_response.json --level 1
 
@@ -360,8 +344,6 @@ def build_parser() -> argparse.ArgumentParser:
                      help="直接传入 API 响应 JSON 字符串")
     src.add_argument("--file", metavar="FILE",
                      help="从文件读取 API 响应 JSON")
-    src.add_argument("--captured", action="store_true",
-                     help="读取代理自动捕获的 data/captured.json（无需手动粘贴）")
     p.add_argument("--level", type=int, choices=[1, 2], default=2,
                    help="运行第几关（1 或 2，默认 2）")
     p.add_argument("--delay", type=float, metavar="SEC",
