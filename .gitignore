@@ -11,7 +11,11 @@ venv/
 env/
 
 # 运行时数据
-data/
+data/calibration.json
+data/alignment_preview.png
+data/solution_preview.png
+data/maps/
+data/parsed/
 
 # macOS
 .DS_Store
