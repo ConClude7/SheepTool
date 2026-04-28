@@ -16,7 +16,6 @@ data/alignment_preview.png
 data/solution_preview.png
 data/maps/
 data/parsed/
-tools/solver/core/data/
 
 # macOS
 .DS_Store
