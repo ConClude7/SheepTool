@@ -18,7 +18,8 @@ SheepTool — 羊了个羊自动化助手
     --step                单步模式（每步按 n 确认）
     --algorithm MODE      求解算法（默认 normal）
 
-运行期间快捷键：  p 暂停/继续   n 下一步   s 结束
+求解期间快捷键：  s 停止求解并采用当前最佳部分解
+点击期间快捷键：  p 暂停/继续   n 下一步   s 结束
 """
 import argparse
 import json
@@ -45,6 +46,7 @@ DEFAULT_CONFIG = {
         "random_attempt_sec": 30,
         "random_workers":     0,
         "partial_accept":     0.0,
+        "manual_stop":        True,
     },
 }
 
@@ -405,9 +407,9 @@ def confirm_before_click(solution_steps: int, total_tiles: int) -> bool:
     try:
         if is_partial:
             answer = input(
-                f"当前解法是部分解（{solution_steps}/{total_tiles} 步），"
-                "继续自动点击可能导致槽位满并失败。"
-                "确认继续请输入 yes，其它输入取消："
+                f"当前解法是从第 0 步开始的最佳部分解（{solution_steps}/{total_tiles} 步），"
+                "只会点击到这个停点，后续可手动使用道具。"
+                "确认开始点击请输入 yes，其它输入取消："
             ).strip().lower()
             return answer == "yes"
 
@@ -495,7 +497,10 @@ def cmd_run(args):
         }, f, indent=2, ensure_ascii=False)
     print(f"解法已保存: {out}")
     if is_partial:
-        print(f"警告：当前仅为部分解（{len(solution)}/{total_tiles} 步），自动执行可能失败。")
+        print(
+            f"提示：当前为从第 0 步开始的部分解（{len(solution)}/{total_tiles} 步），"
+            "自动点击会停在这里，不会继续猜后续步骤。"
+        )
 
     calib = load_calibration()
     try:

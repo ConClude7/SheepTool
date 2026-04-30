@@ -79,13 +79,15 @@ class SheepSolver(object):
 
     def _record_current_progress(self):
         self._current_progress = self._current_pick_count / self._card_count
+        progress_changed = False
         if self._current_progress > self._maximum_progress:
             self._maximum_progress = self._current_progress
+            progress_changed = True
             pick_index_list = self._card_sequence.get_pick_index_list()
             self._best_partial_index_list = [item for item in pick_index_list if item >= 0]
             if self._partial_accept > 0 and self._maximum_progress >= self._partial_accept:
                 self._partial_accept_reached = True
-        self._emit_progress()
+        self._emit_progress(force=progress_changed)
 
     def _generate_current_iteration_time(self):
         current_time = time.time()
@@ -105,6 +107,7 @@ class SheepSolver(object):
             return
 
         self._last_progress_emit_wall_time = now
+        best_partial = self.generate_best_partial_card_id_result()
         try:
             self._progress_queue.put({
                 "type": "progress",
@@ -113,6 +116,8 @@ class SheepSolver(object):
                 "maximum_progress": self._maximum_progress,
                 "pick_count": self._current_pick_count,
                 "total_count": self._card_count,
+                "best_partial": best_partial,
+                "best_partial_steps": len(best_partial) if best_partial else 0,
             })
         except Exception:
             pass

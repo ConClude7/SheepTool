@@ -6,6 +6,7 @@ import struct
 import sys
 import time
 import multiprocessing as mp
+import threading
 from pathlib import Path
 
 SOLVER_DIR = Path(__file__).parent / "tools" / "solver"
@@ -162,6 +163,51 @@ _DEFAULT_PER_ATTEMPT_SEC = 30
 _DEFAULT_MAX_ATTEMPTS    = 30
 _DEFAULT_WORKERS         = 0       # 0 = 自动取 cpu_count
 _DEFAULT_PARTIAL_ACCEPT  = 0.0     # 0 = 不接受部分解
+_DEFAULT_MANUAL_STOP     = True    # 求解阶段按 s 停止，并采用当前最佳部分解
+
+
+# ── 手动停止监听 ──────────────────────────────────────────────────────────────
+
+class _ManualStopMonitor:
+    """求解阶段监听 s 键；失败时静默降级为不可用。"""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.stop_requested = threading.Event()
+        self.available = False
+        self._listener = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            from pynput import keyboard as kb
+        except Exception:
+            return self
+
+        def on_press(key):
+            try:
+                c = key.char
+            except AttributeError:
+                return
+            if c and c.lower() == "s":
+                if self.stop_requested.is_set():
+                    return
+                self.stop_requested.set()
+                print("\n[手动停止] 已收到停止请求，正在采用当前最佳部分解……", flush=True)
+
+        try:
+            self._listener = kb.Listener(on_press=on_press)
+            self._listener.daemon = True
+            self._listener.start()
+            self.available = True
+        except Exception:
+            self._listener = None
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        if self._listener is not None and self._listener.is_alive():
+            self._listener.stop()
 
 
 # ── 实时进度显示 ──────────────────────────────────────────────────────────────
@@ -361,9 +407,10 @@ class _LiveProgressDisplay:
         return _colorize(status, color, self._supports_ansi)
 
 
-def _drain_progress_queue(progress_queue, display: _LiveProgressDisplay):
+def _drain_progress_queue(progress_queue, display: _LiveProgressDisplay) -> list[dict]:
+    events: list[dict] = []
     if progress_queue is None:
-        return
+        return events
     while True:
         try:
             event = progress_queue.get_nowait()
@@ -374,11 +421,39 @@ def _drain_progress_queue(progress_queue, display: _LiveProgressDisplay):
 
         if event.get("type") != "progress":
             continue
+        events.append(event)
         display.update_progress(
             event["label"],
             event.get("current_progress", 0.0),
             event.get("maximum_progress", 0.0),
         )
+    return events
+
+
+def _pick_better_partial(
+    current_partial: list | None,
+    current_progress: float,
+    candidate_partial: list | None,
+    candidate_progress: float,
+) -> tuple[list | None, float]:
+    if candidate_partial and candidate_progress > current_progress:
+        return candidate_partial, candidate_progress
+    return current_partial, current_progress
+
+
+def _update_best_partial_from_events(
+    events: list[dict],
+    best_partial: list | None,
+    best_partial_progress: float,
+) -> tuple[list | None, float]:
+    for event in events:
+        best_partial, best_partial_progress = _pick_better_partial(
+            best_partial,
+            best_partial_progress,
+            event.get("best_partial"),
+            event.get("maximum_progress", 0.0),
+        )
+    return best_partial, best_partial_progress
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -500,52 +575,82 @@ def _solve_deterministic_parallel(
             labels=list(_DETERMINISTIC_ALGORITHMS),
         )
 
-        with mp.Pool(processes=n_workers) as pool:
-            iterator = pool.imap_unordered(_worker_fn_deterministic, tasks)
-            remaining = len(tasks)
-            while remaining > 0:
-                _drain_progress_queue(progress_queue, display)
-                try:
-                    result, partial, max_progress, elapsed, algorithm = iterator.next(timeout=0.2)
-                except mp.TimeoutError:
-                    display.render()
-                    continue
+        manual_stop_enabled = solver_config.get("manual_stop", _DEFAULT_MANUAL_STOP)
+        with _ManualStopMonitor(manual_stop_enabled) as stop_monitor:
+            if stop_monitor.available:
+                print("  求解过程中可按 s 停止，并采用当前最佳部分解。")
 
-                remaining -= 1
-                total_elapsed = time.time() - overall_start
-
-                if partial and max_progress > best_partial_progress:
-                    best_partial_progress = max_progress
-                    best_partial = partial
-
-                display.mark_result(
-                    algorithm,
-                    success=result is not None,
-                    elapsed=elapsed,
-                    max_progress=1.0 if result is not None else max_progress,
-                    current_progress=1.0 if result is not None else 0.0,
-                    steps=len(result) if result is not None else None,
-                )
-                _drain_progress_queue(progress_queue, display)
-                display.render(force=True)
-
-                if result is not None:
-                    pool.terminate()
-                    display.close()
-                    print(
-                        f"  算法 {algorithm} 求解成功，单次 {elapsed:.2f}s，"
-                        f"总耗时 {total_elapsed:.2f}s — 共 {len(result)} 步"
+            with mp.Pool(processes=n_workers) as pool:
+                iterator = pool.imap_unordered(_worker_fn_deterministic, tasks)
+                remaining = len(tasks)
+                while remaining > 0:
+                    events = _drain_progress_queue(progress_queue, display)
+                    best_partial, best_partial_progress = _update_best_partial_from_events(
+                        events,
+                        best_partial,
+                        best_partial_progress,
                     )
-                    return result
 
-                if partial_accept > 0 and best_partial_progress >= partial_accept:
-                    pool.terminate()
-                    display.close()
-                    print(
-                        f"  进度 {best_partial_progress:.1%} ≥ partial_accept={partial_accept:.0%}，"
-                        f"采用部分解（{len(best_partial)} 步），总耗时 {total_elapsed:.2f}s"
+                    if stop_monitor.stop_requested.is_set():
+                        pool.terminate()
+                        display.close()
+                        if best_partial:
+                            print(
+                                f"  已手动停止求解，采用当前最佳部分解 "
+                                f"（{len(best_partial)}/{total} 步，进度 {best_partial_progress:.1%}）。"
+                            )
+                            return best_partial
+                        raise RuntimeError("已手动停止求解，但还没有可用的部分解。")
+
+                    try:
+                        result, partial, max_progress, elapsed, algorithm = iterator.next(timeout=0.2)
+                    except mp.TimeoutError:
+                        display.render()
+                        continue
+
+                    remaining -= 1
+                    total_elapsed = time.time() - overall_start
+
+                    best_partial, best_partial_progress = _pick_better_partial(
+                        best_partial,
+                        best_partial_progress,
+                        partial,
+                        max_progress,
                     )
-                    return best_partial
+
+                    display.mark_result(
+                        algorithm,
+                        success=result is not None,
+                        elapsed=elapsed,
+                        max_progress=1.0 if result is not None else max_progress,
+                        current_progress=1.0 if result is not None else 0.0,
+                        steps=len(result) if result is not None else None,
+                    )
+                    events = _drain_progress_queue(progress_queue, display)
+                    best_partial, best_partial_progress = _update_best_partial_from_events(
+                        events,
+                        best_partial,
+                        best_partial_progress,
+                    )
+                    display.render(force=True)
+
+                    if result is not None:
+                        pool.terminate()
+                        display.close()
+                        print(
+                            f"  算法 {algorithm} 求解成功，单次 {elapsed:.2f}s，"
+                            f"总耗时 {total_elapsed:.2f}s — 共 {len(result)} 步"
+                        )
+                        return result
+
+                    if partial_accept > 0 and best_partial_progress >= partial_accept:
+                        pool.terminate()
+                        display.close()
+                        print(
+                            f"  进度 {best_partial_progress:.1%} ≥ partial_accept={partial_accept:.0%}，"
+                            f"采用部分解（{len(best_partial)} 步），总耗时 {total_elapsed:.2f}s"
+                        )
+                        return best_partial
 
         display.close()
 
@@ -631,49 +736,79 @@ def _solve_random_parallel(
                 visible_rows=min(max_attempts, max(n_workers + 2, 6)),
             )
 
-            with mp.Pool(processes=n_workers) as pool:
-                iterator = pool.imap_unordered(_worker_fn, tasks)
-                remaining = len(tasks)
-                while remaining > 0:
-                    _drain_progress_queue(progress_queue, display)
-                    try:
-                        result, partial, max_progress, elapsed, attempt_num = iterator.next(timeout=0.2)
-                    except mp.TimeoutError:
-                        display.render()
-                        continue
+            manual_stop_enabled = solver_config.get("manual_stop", _DEFAULT_MANUAL_STOP)
+            with _ManualStopMonitor(manual_stop_enabled) as stop_monitor:
+                if stop_monitor.available:
+                    print("  求解过程中可按 s 停止，并采用当前最佳部分解。")
 
-                    remaining -= 1
-                    total_elapsed = time.time() - overall_start
-                    label = _random_attempt_label(attempt_num)
+                with mp.Pool(processes=n_workers) as pool:
+                    iterator = pool.imap_unordered(_worker_fn, tasks)
+                    remaining = len(tasks)
+                    while remaining > 0:
+                        events = _drain_progress_queue(progress_queue, display)
+                        best_partial, best_partial_progress = _update_best_partial_from_events(
+                            events,
+                            best_partial,
+                            best_partial_progress,
+                        )
 
-                    if partial and max_progress > best_partial_progress:
-                        best_partial_progress = max_progress
-                        best_partial = partial
+                        if stop_monitor.stop_requested.is_set():
+                            pool.terminate()
+                            display.close()
+                            if best_partial:
+                                print(
+                                    f"  已手动停止求解，采用当前最佳部分解 "
+                                    f"（{len(best_partial)}/{total} 步，进度 {best_partial_progress:.1%}）。"
+                                )
+                                return best_partial
+                            raise RuntimeError("已手动停止求解，但还没有可用的部分解。")
 
-                    display.mark_result(
-                        label,
-                        success=result is not None,
-                        elapsed=elapsed,
-                        max_progress=1.0 if result is not None else max_progress,
-                        current_progress=1.0 if result is not None else 0.0,
-                        steps=len(result) if result is not None else None,
-                    )
-                    _drain_progress_queue(progress_queue, display)
-                    display.render(force=True)
+                        try:
+                            result, partial, max_progress, elapsed, attempt_num = iterator.next(timeout=0.2)
+                        except mp.TimeoutError:
+                            display.render()
+                            continue
 
-                    if result is not None:
-                        pool.terminate()
-                        display.close()
-                        print(f"  第 {attempt_num} 次尝试成功，单次 {elapsed:.2f}s，"
-                              f"总耗时 {total_elapsed:.2f}s — 共 {len(result)} 步")
-                        return result
+                        remaining -= 1
+                        total_elapsed = time.time() - overall_start
+                        label = _random_attempt_label(attempt_num)
 
-                    if partial_accept > 0 and best_partial_progress >= partial_accept:
-                        pool.terminate()
-                        display.close()
-                        print(f"  进度 {best_partial_progress:.1%} ≥ partial_accept={partial_accept:.0%}，"
-                              f"采用部分解（{len(best_partial)} 步），总耗时 {total_elapsed:.2f}s")
-                        return best_partial
+                        best_partial, best_partial_progress = _pick_better_partial(
+                            best_partial,
+                            best_partial_progress,
+                            partial,
+                            max_progress,
+                        )
+
+                        display.mark_result(
+                            label,
+                            success=result is not None,
+                            elapsed=elapsed,
+                            max_progress=1.0 if result is not None else max_progress,
+                            current_progress=1.0 if result is not None else 0.0,
+                            steps=len(result) if result is not None else None,
+                        )
+                        events = _drain_progress_queue(progress_queue, display)
+                        best_partial, best_partial_progress = _update_best_partial_from_events(
+                            events,
+                            best_partial,
+                            best_partial_progress,
+                        )
+                        display.render(force=True)
+
+                        if result is not None:
+                            pool.terminate()
+                            display.close()
+                            print(f"  第 {attempt_num} 次尝试成功，单次 {elapsed:.2f}s，"
+                                  f"总耗时 {total_elapsed:.2f}s — 共 {len(result)} 步")
+                            return result
+
+                        if partial_accept > 0 and best_partial_progress >= partial_accept:
+                            pool.terminate()
+                            display.close()
+                            print(f"  进度 {best_partial_progress:.1%} ≥ partial_accept={partial_accept:.0%}，"
+                                  f"采用部分解（{len(best_partial)} 步），总耗时 {total_elapsed:.2f}s")
+                            return best_partial
 
             display.close()
 

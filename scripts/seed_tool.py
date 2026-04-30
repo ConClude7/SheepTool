@@ -47,6 +47,17 @@ def _read_bytes(path_or_hex: str | None, *, default: bytes = b"") -> bytes:
     return bytes.fromhex(path_or_hex.replace(" ", ""))
 
 
+def _read_ciphertext(value: str, *, fmt: str) -> bytes:
+    path = Path(value)
+    if path.exists():
+        return path.read_bytes()
+    if fmt == "hex":
+        return bytes.fromhex(value.replace(" ", ""))
+    if fmt == "base64":
+        return _b64decode(value)
+    raise ValueError(f"unknown ciphertext format: {fmt}")
+
+
 def _read_text_or_value(value: str | None) -> str | None:
     if not value:
         return None
@@ -248,7 +259,7 @@ def cmd_decode(args: argparse.Namespace) -> None:
 
 
 def cmd_derive(args: argparse.Namespace) -> None:
-    cipher = _read_bytes(args.ciphertext)
+    cipher = _read_ciphertext(args.ciphertext, fmt=args.ciphertext_format)
     plain = _read_plaintext(args.plaintext, fmt=args.plaintext_format)
     if len(plain) > len(cipher):
         raise ValueError(f"plaintext longer than ciphertext: {len(plain)} > {len(cipher)}")
@@ -343,7 +354,13 @@ def build_parser() -> argparse.ArgumentParser:
     dec.set_defaults(func=cmd_decode)
 
     drv = sub.add_parser("derive", help="从已知明文/密文推出 OFB keystream")
-    drv.add_argument("--ciphertext", required=True, help="密文文件路径，或 hex 字符串")
+    drv.add_argument("--ciphertext", required=True, help="密文文件路径、hex 字符串或 base64 字符串")
+    drv.add_argument(
+        "--ciphertext-format",
+        choices=["hex", "base64"],
+        default="hex",
+        help="当 --ciphertext 不是文件路径时的编码格式",
+    )
     drv.add_argument("--plaintext", required=True, help="明文字符串/文件/hex/base64")
     drv.add_argument(
         "--plaintext-format",

@@ -5,6 +5,7 @@
   "solver": {
     "show_progress": true,
     "random_workers": 0,
+    "manual_stop": true,
     "partial_accept": 1,
     "solve_first": 0.8,
     "time_limit": -1,
