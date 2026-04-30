@@ -43,6 +43,40 @@ pip install -r requirements.txt
 - `sheep/v1/game/tag/game/start`（标签关卡）
 - `sheep/v1/game/world/game_start`（世界关卡）
 
+如果响应里 `need_seed=true` 且 `map_seed` 为 `[0,0,0,0]`，需要先通过 seed
+接口换取真实种子。可以用诊断工具解密 `map_info_ex_seed` 的二进制响应：
+
+```bash
+# 只有旧请求 info 时，只能解出和请求等长的前缀，用于确认链路
+python scripts/seed_tool.py decode \
+  --response data/seed_response_13267.bin \
+  --request-info 'AXW/eHxH64V73Ph+MUEf1A==' \
+  --seed QxZW6GTh_QV
+
+# 如果抓到其它 AES-OFB 上传包，且能在本地存储找到上传前明文，
+# 可以先推出更长 keystream，再解 seed 响应
+python scripts/seed_tool.py derive \
+  --ciphertext '<encrypt_data base64 解码后的 hex 或文件>' \
+  --plaintext '<上传前 JSON 明文>' \
+  --plaintext-format uri \
+  --output data/ofb_keystream.bin
+python scripts/seed_tool.py decode \
+  --response data/seed_response_13267.bin \
+  --keystream-hex data/ofb_keystream.bin
+
+# 拿到 wx.getUserCryptoManager().getLatestUserKey() 的 encryptKey / iv 后，
+# 可直接复放 seed 请求并解析完整 mapSeed
+python scripts/seed_tool.py request \
+  --seed QxZW6GTh_QV \
+  --key '<encryptKey>' \
+  --iv '<iv>' \
+  --encrypt-key-version 14 \
+  --token '<t header>'
+```
+
+主流程会优先读取 JSON 里的 `map_seed_real` / `real_map_seed` / `seed_map`
+四元数组；拿到真实 `mapSeed` 后，把它作为其中任一字段放进响应 JSON 即可继续求解。
+
 ### 2. 校准窗口
 
 首次使用或微信窗口位置变化后，需要重新校准：
@@ -62,6 +96,9 @@ python main.py preview
 ```bash
 # 交互式粘贴 JSON（粘贴后按 Ctrl+D 确认）
 python main.py run
+
+# 每日关卡 need_seed 模式：按提示依次粘贴 map_info_ex Response 和 seed Request
+python main.py run --daily
 
 # 从文件读取（含特殊字符时推荐）
 python main.py run --file response.json

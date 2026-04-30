@@ -1,3 +1,4 @@
 pyautogui>=0.9.54
 Pillow>=9.0.0
 pynput>=1.7.6
+pycryptodome>=3.20.0

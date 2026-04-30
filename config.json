@@ -1,5 +1,5 @@
 {
-  "click_delay": 1.5,
+  "click_delay": 0.6,
   "pause_after": 0,
   "algorithm": "normal",
   "solver": {
