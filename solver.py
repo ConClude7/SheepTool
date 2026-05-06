@@ -2,11 +2,13 @@
 import base64
 import os
 import queue
+import select
 import struct
 import sys
+import termios
 import time
 import multiprocessing as mp
-import threading
+import tty
 from pathlib import Path
 
 SOLVER_DIR = Path(__file__).parent / "tools" / "solver"
@@ -168,46 +170,51 @@ _DEFAULT_MANUAL_STOP     = True    # 求解阶段按 s 停止，并采用当前�
 
 # ── 手动停止监听 ──────────────────────────────────────────────────────────────
 
-class _ManualStopMonitor:
-    """求解阶段监听 s 键；失败时静默降级为不可用。"""
+class _TerminalStopMonitor:
+    """求解阶段只监听当前终端输入的 s；失败时静默降级为不可用。"""
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self.stop_requested = threading.Event()
+        self.stop_requested = False
         self.available = False
-        self._listener = None
+        self._fd = None
+        self._old_termios = None
 
     def __enter__(self):
-        if not self.enabled:
+        if not self.enabled or not sys.stdin.isatty():
             return self
         try:
-            from pynput import keyboard as kb
-        except Exception:
-            return self
-
-        def on_press(key):
-            try:
-                c = key.char
-            except AttributeError:
-                return
-            if c and c.lower() == "s":
-                if self.stop_requested.is_set():
-                    return
-                self.stop_requested.set()
-                print("\n[手动停止] 已收到停止请求，正在采用当前最佳部分解……", flush=True)
-
-        try:
-            self._listener = kb.Listener(on_press=on_press)
-            self._listener.daemon = True
-            self._listener.start()
+            self._fd = sys.stdin.fileno()
+            self._old_termios = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
             self.available = True
         except Exception:
-            self._listener = None
+            self._fd = None
+            self._old_termios = None
         return self
 
     def __exit__(self, _exc_type, _exc, _tb):
-        if self._listener is not None and self._listener.is_alive():
-            self._listener.stop()
+        if self._fd is not None and self._old_termios is not None:
+            try:
+                termios.tcflush(self._fd, termios.TCIFLUSH)
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_termios)
+            except Exception:
+                pass
+
+    def poll(self) -> bool:
+        if not self.available or self.stop_requested:
+            return self.stop_requested
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            if not ready:
+                return False
+            c = sys.stdin.read(1)
+        except Exception:
+            return False
+        if c.lower() == "s":
+            self.stop_requested = True
+            print("\n[手动停止] 已收到停止请求，正在采用当前最佳部分解……", flush=True)
+        return self.stop_requested
 
 
 # ── 实时进度显示 ──────────────────────────────────────────────────────────────
@@ -576,9 +583,9 @@ def _solve_deterministic_parallel(
         )
 
         manual_stop_enabled = solver_config.get("manual_stop", _DEFAULT_MANUAL_STOP)
-        with _ManualStopMonitor(manual_stop_enabled) as stop_monitor:
+        with _TerminalStopMonitor(manual_stop_enabled) as stop_monitor:
             if stop_monitor.available:
-                print("  求解过程中可按 s 停止，并采用当前最佳部分解。")
+                print("  求解过程中可在当前终端按 s 停止，并采用当前最佳部分解。")
 
             with mp.Pool(processes=n_workers) as pool:
                 iterator = pool.imap_unordered(_worker_fn_deterministic, tasks)
@@ -591,7 +598,7 @@ def _solve_deterministic_parallel(
                         best_partial_progress,
                     )
 
-                    if stop_monitor.stop_requested.is_set():
+                    if stop_monitor.poll():
                         pool.terminate()
                         display.close()
                         if best_partial:
@@ -737,9 +744,9 @@ def _solve_random_parallel(
             )
 
             manual_stop_enabled = solver_config.get("manual_stop", _DEFAULT_MANUAL_STOP)
-            with _ManualStopMonitor(manual_stop_enabled) as stop_monitor:
+            with _TerminalStopMonitor(manual_stop_enabled) as stop_monitor:
                 if stop_monitor.available:
-                    print("  求解过程中可按 s 停止，并采用当前最佳部分解。")
+                    print("  求解过程中可在当前终端按 s 停止，并采用当前最佳部分解。")
 
                 with mp.Pool(processes=n_workers) as pool:
                     iterator = pool.imap_unordered(_worker_fn, tasks)
@@ -752,7 +759,7 @@ def _solve_random_parallel(
                             best_partial_progress,
                         )
 
-                        if stop_monitor.stop_requested.is_set():
+                        if stop_monitor.poll():
                             pool.terminate()
                             display.close()
                             if best_partial:

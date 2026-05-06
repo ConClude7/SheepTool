@@ -64,6 +64,9 @@ python scripts/seed_tool.py decode \
   --response data/seed_response_13267.bin \
   --keystream-hex data/ofb_keystream.bin
 
+# 如果抓到同版本 game_over_ex 的 Raw Request，可直接生成对应版本 keystream
+python scripts/seed_tool.py derive-game-over '<Raw...folder>'
+
 # 拿到 wx.getUserCryptoManager().getLatestUserKey() 的 encryptKey / iv 后，
 # 可直接复放 seed 请求并解析完整 mapSeed
 python scripts/seed_tool.py request \
@@ -97,7 +100,7 @@ python main.py preview
 # 交互式粘贴 JSON（粘贴后按 Ctrl+D 确认）
 python main.py run
 
-# 每日关卡 need_seed 模式：按提示依次粘贴 map_info_ex Response 和 seed Request
+# 每日关卡 need_seed 模式：可粘贴 Raw 抓包目录；缺 keystream 时按提示补 game_over_ex Raw 目录
 python main.py run --daily
 
 # 从文件读取（含特殊字符时推荐）

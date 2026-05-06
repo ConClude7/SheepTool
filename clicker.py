@@ -5,8 +5,9 @@
 """
 import json
 import random
-import threading
+import sys
 import time
+from collections import deque
 from pathlib import Path
 
 from macos_window import get_wechat_window
@@ -110,7 +111,7 @@ def card_id_to_coords(card_id: str, calib: dict, map_data: dict,
 
 class ClickController:
     """
-    键盘控制（程序运行期间全局监听）：
+    键盘控制（点击执行期间全局监听）：
       p  — 暂停 / 继续
       n  — 执行下一步（暂停状态下）
       s  — 结束
@@ -120,12 +121,14 @@ class ClickController:
         self.delay = delay
         self.pause_after = pause_after
 
-        self._paused    = threading.Event()
-        self._paused.set()          # 默认非暂停
-        self._stopped   = threading.Event()
-        self._step_step = threading.Event()
+        self._paused = False
+        self._stopped = False
+        self._step_requested = False
         self._step_mode = False
         self.click_count = 0
+        self._recent_logs = deque(maxlen=5)
+        self._last_render_line_count = 0
+        self._supports_ansi = sys.stdout.isatty()
 
         self._win_pos: tuple[int, int] | None = None
         self._win_refresh_interval = 10  # 每 N 次点击刷新一次窗口位置
@@ -141,6 +144,8 @@ class ClickController:
             c = key.char
         except AttributeError:
             return
+
+        c = c.lower()
         if c == "p":
             self._toggle_pause()
         elif c == "n":
@@ -149,33 +154,33 @@ class ClickController:
             self._do_stop()
 
     def _toggle_pause(self):
-        if self._paused.is_set():
+        if not self._paused:
             self._do_pause()
             return
 
         self._step_mode = False
-        self._step_step.set()
-        self._paused.set()
+        self._step_requested = True
+        self._paused = False
         print("[继续]")
 
     def _do_pause(self):
-        if not self._paused.is_set():
+        if self._paused:
             return
-        self._paused.clear()
+        self._paused = True
         self._step_mode = False
         print(f"\n[暂停] 已暂停（第 {self.click_count} 步）  p=继续  n=下一步  s=结束")
 
     def _do_step_once(self):
-        if self._paused.is_set():
-            self._paused.clear()
+        if not self._paused:
+            self._paused = True
         self._step_mode = True
-        self._step_step.set()
+        self._step_requested = True
         print(f"[下一步] 将执行第 {self.click_count + 1} 步")
 
     def _do_stop(self):
-        self._stopped.set()
-        self._paused.set()
-        self._step_step.set()
+        self._stopped = True
+        self._paused = False
+        self._step_requested = True
         print("\n[退出] 用户终止")
 
     # ── 等待逻辑 ──────────────────────────────────────────────────────────────
@@ -184,17 +189,17 @@ class ClickController:
         """在暂停或单步模式下阻塞，直到允许继续。"""
         step_prompt_shown = False
         while True:
-            if self._stopped.is_set():
+            if self._stopped:
                 raise KeyboardInterrupt("用户退出")
 
             if self._step_mode:
                 if not step_prompt_shown:
                     print(f"  [单步 #{self.click_count + 1}] 按 n 执行下一步，p 恢复自动，s 结束...")
                     step_prompt_shown = True
-                if self._step_step.is_set():
-                    self._step_step.clear()
+                if self._step_requested:
+                    self._step_requested = False
                     return
-            elif self._paused.is_set():
+            elif not self._paused:
                 return
 
             time.sleep(0.05)
@@ -220,8 +225,8 @@ class ClickController:
     # ── 点击 ──────────────────────────────────────────────────────────────────
 
     def click(self, x: int, y: int, label: str = ""):
-        self._wait()
         self._auto_pause_check()
+        self._wait()
 
         # 先实际点击，再更新计数和日志，避免“日志先走、点击后到”造成观感错位。
         pyautogui.mouseDown(x, y)
@@ -229,20 +234,50 @@ class ClickController:
         pyautogui.mouseUp(x, y)
 
         self.click_count += 1
-        print(f"  [{self.click_count:3d}] ({x:4d}, {y:4d})  {label}")
+        self._record_click_log(x, y, label)
         jitter = random.uniform(-0.1, 0.1)
-        time.sleep(max(0.0, self.delay + jitter))
+        self._sleep_with_controls(max(0.0, self.delay + jitter))
+
+    def _record_click_log(self, x: int, y: int, label: str):
+        self._recent_logs.append(f"  [{self.click_count:3d}] ({x:4d}, {y:4d})  {label}")
+        self._render_recent_logs()
+
+    def _render_recent_logs(self, force: bool = False):
+        lines = ["最近 5 次操作：", *self._recent_logs]
+        if not self._supports_ansi:
+            if force:
+                print("\n".join(lines), flush=True)
+            return
+
+        if self._last_render_line_count:
+            sys.stdout.write(f"\x1b[{self._last_render_line_count}F")
+
+        max_lines = max(self._last_render_line_count, len(lines))
+        for idx in range(max_lines):
+            line = lines[idx] if idx < len(lines) else ""
+            sys.stdout.write("\x1b[2K" + line + "\n")
+        sys.stdout.flush()
+        self._last_render_line_count = max_lines
+
+    def _sleep_with_controls(self, duration: float):
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            if self._stopped:
+                raise KeyboardInterrupt("用户退出")
+            if self._paused or self._step_mode:
+                self._wait()
+            time.sleep(min(0.05, max(0.0, deadline - time.time())))
 
     def stop(self):
-        self._stopped.set()
-        self._paused.set()
-        self._step_step.set()
+        self._stopped = True
+        self._paused = False
+        self._step_requested = True
         if self._listener.is_alive():
             self._listener.stop()
 
     def enable_step_mode(self):
         self._step_mode = True
-        self._paused.clear()
+        self._paused = True
         print("[单步模式] 按 n 执行每一步，p 切换回自动")
 
 

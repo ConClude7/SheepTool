@@ -62,9 +62,41 @@ def _read_text_or_value(value: str | None) -> str | None:
     if not value:
         return None
     path = Path(value)
-    if path.exists():
+    if path.exists() and path.is_file():
         return path.read_text(encoding="utf-8").strip()
     return value
+
+
+def _find_raw_request_file(folder: Path, endpoint: str) -> Path:
+    matches = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and endpoint in p.name
+        and "request" in p.name.lower()
+    ]
+    if not matches:
+        raise ValueError(f"Raw 抓包目录里找不到 {endpoint} Request: {folder}")
+    matches.sort(key=lambda p: (len(p.name), p.name))
+    return matches[0]
+
+
+def _read_raw_request(value: str, endpoint: str) -> str:
+    path = Path(value).expanduser()
+    if path.exists() and path.is_dir():
+        request_file = _find_raw_request_file(path, endpoint)
+        print(f"已从 Raw 目录读取 {endpoint} Request: {request_file.name}")
+        return request_file.read_text(encoding="utf-8").strip()
+    if path.exists() and path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    return value
+
+
+def _split_http_body(raw: str) -> str:
+    if "\r\n\r\n" in raw:
+        return raw.split("\r\n\r\n", 1)[1].strip()
+    if "\n\n" in raw:
+        return raw.split("\n\n", 1)[1].strip()
+    return raw.strip()
 
 
 def _read_plaintext(value: str | None, *, fmt: str) -> bytes:
@@ -270,6 +302,44 @@ def cmd_derive(args: argparse.Namespace) -> None:
     print(f"keystream_hex={keystream.hex(' ')}")
 
 
+def _game_over_plaintext_from_request(raw: str) -> tuple[int, bytes, bytes]:
+    body = _split_http_body(raw)
+    payload = json.loads(body)
+    if not isinstance(payload, dict):
+        raise ValueError("game_over_ex 请求体不是 JSON 对象")
+
+    encrypt_data = payload.pop("encrypt_data", None)
+    version = payload.pop("encrypt_key_version", None)
+    if not encrypt_data or version is None:
+        raise ValueError("game_over_ex 请求缺少 encrypt_data 或 encrypt_key_version")
+
+    plain_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    plain = urllib.parse.quote(plain_json, safe="-_.!~*'()").encode("ascii")
+    return int(version), _b64decode(str(encrypt_data)), plain
+
+
+def cmd_derive_game_over(args: argparse.Namespace) -> None:
+    request = args.request or args.request_arg
+    if not request:
+        raise ValueError("请提供 game_over_ex Raw 目录、请求文件路径或请求文本")
+    raw = _read_raw_request(request, "game_over_ex")
+    version, cipher, plain = _game_over_plaintext_from_request(raw)
+    if len(plain) > len(cipher):
+        raise ValueError(f"plaintext longer than ciphertext: {len(plain)} > {len(cipher)}")
+
+    keystream = _xor(cipher, plain)
+    output = Path(args.output) if args.output else (
+        Path(__file__).resolve().parent.parent / "data" / "keystreams" / f"ofb_v{version}.bin"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(keystream)
+
+    print(f"encrypt_key_version={version}")
+    print(f"keystream_len={len(keystream)}")
+    print(f"output={output}")
+    print(f"keystream_hex={keystream.hex(' ')}")
+
+
 def decode_seed_ack_partial(data: bytes) -> dict:
     """Best-effort parser for truncated known-plaintext OFB output."""
     result: dict[str, object] = {}
@@ -370,6 +440,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     drv.add_argument("--output", help="保存 keystream bytes 到文件")
     drv.set_defaults(func=cmd_derive)
+
+    drv_go = sub.add_parser("derive-game-over", help="从 Raw game_over_ex 请求直接生成 OFB keystream")
+    drv_go.add_argument("request_arg", nargs="?", help="game_over_ex Raw 目录、Raw HTTP 请求文件路径或文本")
+    drv_go.add_argument("--request", help="game_over_ex Raw 目录、Raw HTTP 请求文件路径或文本")
+    drv_go.add_argument("--output", help="保存 keystream bytes；默认 data/keystreams/ofb_v{version}.bin")
+    drv_go.set_defaults(func=cmd_derive_game_over)
 
     req = sub.add_parser("request", help="用 wx encryptKey/iv 复放 seed 请求并解析响应")
     req.add_argument("--seed", required=True, help="map_seed_2")

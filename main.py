@@ -152,11 +152,86 @@ def _paste_json_interactively() -> str:
 def _paste_one_line(title: str) -> str:
     """读取一行抓包文本或文件路径。"""
     print(title)
-    print("粘贴后直接回车确认；也可以输入本地文件路径。")
+    print("粘贴后直接回车确认；也可以输入本地文件/Raw 抓包目录路径。")
     try:
         value = input("> ").strip()
     except EOFError:
         return ""
+    path = Path(value).expanduser()
+    if path.exists() and path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    return value
+
+
+def _as_existing_dir(value: str) -> Path | None:
+    path = Path(value).expanduser()
+    if path.exists() and path.is_dir():
+        return path
+    return None
+
+
+def _find_raw_capture_file(folder: Path, endpoint: str, direction: str) -> Path:
+    direction = direction.lower()
+    matches = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and endpoint in p.name
+        and not (endpoint == "map_info_ex" and "map_info_ex_seed" in p.name)
+        and direction in p.name.lower()
+    ]
+    if not matches:
+        raise ValueError(f"Raw 抓包目录里找不到 {endpoint} 的 {direction} 文件: {folder}")
+    matches.sort(key=lambda p: (len(p.name), p.name))
+    return matches[0]
+
+
+def _find_optional_raw_capture_file(folder: Path, endpoint: str, direction: str) -> Path | None:
+    direction = direction.lower()
+    matches = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and endpoint in p.name
+        and direction in p.name.lower()
+    ]
+    matches.sort(key=lambda p: (len(p.name), p.name))
+    return matches[0] if matches else None
+
+
+def _load_daily_capture_dir(folder: Path) -> tuple[str, str | None, str | None]:
+    map_resp = _find_raw_capture_file(folder, "map_info_ex", "response")
+    seed_requests = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and "map_info_ex_seed" in p.name
+        and "request" in p.name.lower()
+    ]
+    seed_request = sorted(seed_requests, key=lambda p: (len(p.name), p.name))[0] if seed_requests else None
+    game_over_request = _find_optional_raw_capture_file(folder, "game_over_ex", "request")
+    raw_map = map_resp.read_text(encoding="utf-8", errors="replace").strip()
+    raw_seed = (
+        seed_request.read_text(encoding="utf-8", errors="replace").strip()
+        if seed_request else None
+    )
+    raw_game_over = (
+        game_over_request.read_text(encoding="utf-8", errors="replace").strip()
+        if game_over_request else None
+    )
+    print(f"已从 Raw 目录读取 map_info_ex Response: {map_resp.name}", flush=True)
+    if seed_request:
+        print(f"已从 Raw 目录读取 map_info_ex_seed Request: {seed_request.name}", flush=True)
+    if game_over_request:
+        print(f"已从 Raw 目录读取 game_over_ex Request: {game_over_request.name}", flush=True)
+    return raw_map, raw_seed, raw_game_over
+
+
+def _read_game_over_capture(value: str) -> str:
+    folder = _as_existing_dir(value)
+    if folder:
+        request_file = _find_optional_raw_capture_file(folder, "game_over_ex", "request")
+        if not request_file:
+            raise ValueError(f"Raw 抓包目录里找不到 game_over_ex Request: {folder}")
+        print(f"已从 Raw 目录读取 game_over_ex Request: {request_file.name}", flush=True)
+        return request_file.read_text(encoding="utf-8", errors="replace").strip()
     path = Path(value).expanduser()
     if path.exists() and path.is_file():
         return path.read_text(encoding="utf-8", errors="replace").strip()
@@ -298,8 +373,32 @@ def _replay_seed_request(raw_request: str) -> bytes:
         return resp.read()
 
 
-def _resolve_daily_seed(api_data: dict, raw_seed_request: str) -> dict:
-    from scripts.seed_tool import _xor, decode_seed_ack
+def _try_save_keystream_from_game_over(raw_game_over_request: str, expected_version: int) -> bytes | None:
+    from scripts.seed_tool import _game_over_plaintext_from_request, _xor
+
+    version, cipher, plain = _game_over_plaintext_from_request(raw_game_over_request)
+    if version != expected_version:
+        print(
+            f"忽略 game_over_ex：版本是 v{version}，当前 seed 需要 v{expected_version}。",
+            flush=True,
+        )
+        return None
+    keystream = _xor(cipher, plain)
+    out = _save_keystream_cache(version, keystream)
+    print(f"已自动生成 v{version} keystream: {out}", flush=True)
+    return keystream
+
+
+def _resolve_daily_seed(
+    api_data: dict,
+    raw_seed_request: str,
+    raw_game_over_request: str | None = None,
+) -> dict:
+    from scripts.seed_tool import (
+        _xor,
+        decode_seed_ack,
+        derive_keystream_from_request,
+    )
 
     if _looks_like_hex_bytes(raw_seed_request):
         seed_response = _parse_hex_bytes(raw_seed_request)
@@ -315,10 +414,37 @@ def _resolve_daily_seed(api_data: dict, raw_seed_request: str) -> dict:
         raise ValueError("seed 请求缺少 encryptKeyVersion 或 info")
 
     keystream = _load_keystream(version)
+    if not keystream and raw_game_over_request:
+        keystream = _try_save_keystream_from_game_over(raw_game_over_request, version)
+    if not keystream and raw_game_over_request is None and sys.stdin.isatty():
+        raw_game_over = _paste_one_line(
+            f"\n本地没有 v{version} keystream。"
+            "可粘贴同版本 /sheep/v1/game/game_over_ex 的 Raw 目录或 Request，"
+            "直接回车则跳过："
+        )
+        if raw_game_over:
+            keystream = _try_save_keystream_from_game_over(
+                _read_game_over_capture(raw_game_over),
+                version,
+            )
+
     if not keystream:
+        prefix_note = ""
+        seed_2 = api_data.get("map_seed_2")
+        if isinstance(seed_2, str) and seed_2:
+            try:
+                prefix_len = len(derive_keystream_from_request(info, seed_2))
+                prefix_note = (
+                    f"\n这次 seed Request 只能推出 {prefix_len} 字节前缀，"
+                    "seed Response 通常需要 38 字节才能解出完整 mapSeed。"
+                )
+            except ValueError:
+                prefix_note = ""
         raise ValueError(
-            f"本地没有 encryptKeyVersion={version} 的 OFB keystream。\n"
-            "需要先抓一次同版本 game_over_ex，并用 scripts/seed_tool.py derive 生成缓存。"
+            f"本地没有 encryptKeyVersion={version} 的完整 OFB keystream。"
+            f"{prefix_note}\n"
+            "需要先抓一次同版本 game_over_ex，然后运行：\n"
+            "python3 scripts/seed_tool.py derive-game-over '<Raw...folder>'"
         )
 
     if len(keystream) < 37:
@@ -355,6 +481,12 @@ def read_daily_api_data() -> dict:
     raw_map = _paste_one_line(
         "\n[1/2] 请粘贴 /sheep/v1/game/map_info_ex 的 Response JSON（或文件路径）："
     )
+    capture_dir = _as_existing_dir(raw_map)
+    raw_seed_from_dir = None
+    raw_game_over_from_dir = None
+    if capture_dir:
+        raw_map, raw_seed_from_dir, raw_game_over_from_dir = _load_daily_capture_dir(capture_dir)
+
     parsed = _parse_json_or_http(raw_map)
     data = parsed.get("data", parsed)
     api_data = _build_api_data(data, data)
@@ -363,11 +495,11 @@ def read_daily_api_data() -> dict:
         print("map_info_ex 已包含真实 map_seed，不需要 seed 请求。")
         return api_data
 
-    raw_seed = _paste_one_line(
+    raw_seed = raw_seed_from_dir or _paste_one_line(
         "\n[2/2] 请粘贴 /sheep/v1/game/map_info_ex_seed 的 Request（Raw HTTP），"
         "或 seed Response 的十六进制 bytes（或文件路径）："
     )
-    return _resolve_daily_seed(api_data, raw_seed)
+    return _resolve_daily_seed(api_data, raw_seed, raw_game_over_from_dir)
 
 
 # ── 地图下载 + 信息展示 ───────────────────────────────────────────────────────
@@ -409,9 +541,9 @@ def confirm_before_click(solution_steps: int, total_tiles: int) -> bool:
             answer = input(
                 f"当前解法是从第 0 步开始的最佳部分解（{solution_steps}/{total_tiles} 步），"
                 "只会点击到这个停点，后续可手动使用道具。"
-                "确认开始点击请输入 yes，其它输入取消："
+                "是否开始自动点击？[y/N] "
             ).strip().lower()
-            return answer == "yes"
+            return answer == "y"
 
         answer = input(
             f"求解已完成（{solution_steps}/{total_tiles} 步），"
@@ -419,7 +551,7 @@ def confirm_before_click(solution_steps: int, total_tiles: int) -> bool:
         ).strip().lower()
     except EOFError:
         return False
-    return answer in {"y", "yes"}
+    return answer == "y"
 
 
 def confirm_preview_ready(prompt: str) -> bool:
