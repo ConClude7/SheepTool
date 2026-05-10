@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import base64
 import os
 import queue
@@ -151,10 +152,9 @@ def _worker_fn_deterministic(args: tuple) -> tuple:
 # ── 确定性算法列表 ────────────────────────────────────────────────────────────
 
 _DETERMINISTIC_ALGORITHMS = [
-    "normal",
+    # "mrv",
     "level-top",
-    "level-bottom",
-    "index-ascending",
+    # "triple-greedy",
     "index-descending",
 ]
 
@@ -362,7 +362,8 @@ class _LiveProgressDisplay:
             current = _colorize(_format_progress(status["current"]), "blue", self._supports_ansi)
             maximum = _colorize(_format_progress(status["max"]), "green", self._supports_ansi)
             status_text = self._format_status(status["status"])
-            extra = f" | 用时 {_colorize(f'{status['elapsed']:.2f}s', 'magenta', self._supports_ansi)}" if status["elapsed"] is not None else ""
+            elapsed_str = f"{status['elapsed']:.2f}s" if status["elapsed"] is not None else ""
+            extra = f" | 用时 {_colorize(elapsed_str, 'magenta', self._supports_ansi)}" if status["elapsed"] is not None else ""
             if status["steps"] is not None and status["status"] == "成功":
                 extra += f" | 步数 {_colorize(str(status['steps']), 'cyan', self._supports_ansi)}"
             lines.append(

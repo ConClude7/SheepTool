@@ -1,5 +1,9 @@
 {
   "click_delay": 0.6,
+  "first_click_delay": 0.2,
+  "start_delay": 3.0,
+  "warmup_steps": 5,
+  "warmup_click_delay": 0.35,
   "pause_after": 0,
   "algorithm": "normal",
   "solver": {

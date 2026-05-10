@@ -10,7 +10,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from macos_window import get_wechat_window
+from macos_window import bring_wechat_to_front, get_wechat_window
 
 PROJECT_DIR = Path(__file__).parent
 VENV_PYTHON = PROJECT_DIR / ".venv" / "bin" / "python"
@@ -117,9 +117,17 @@ class ClickController:
       s  — 结束
     """
 
-    def __init__(self, delay: float = 0.4, pause_after: int = 0):
+    def __init__(
+        self,
+        delay: float = 0.4,
+        pause_after: int = 0,
+        warmup_steps: int = 0,
+        warmup_delay: float | None = None,
+    ):
         self.delay = delay
         self.pause_after = pause_after
+        self.warmup_steps = max(0, warmup_steps)
+        self.warmup_delay = warmup_delay
 
         self._paused = False
         self._stopped = False
@@ -235,8 +243,16 @@ class ClickController:
 
         self.click_count += 1
         self._record_click_log(x, y, label)
+        delay = self._current_delay()
+        if delay <= 0:
+            return
         jitter = random.uniform(-0.1, 0.1)
-        self._sleep_with_controls(max(0.0, self.delay + jitter))
+        self._sleep_with_controls(max(0.0, delay + jitter))
+
+    def _current_delay(self) -> float:
+        if self.warmup_delay is None or self.click_count > self.warmup_steps:
+            return self.delay
+        return max(self.delay, self.warmup_delay)
 
     def _record_click_log(self, x: int, y: int, label: str):
         self._recent_logs.append(f"  [{self.click_count:3d}] ({x:4d}, {y:4d})  {label}")
@@ -290,9 +306,17 @@ def execute_solution(
     delay: float = 0.4,
     pause_after: int = 0,
     step_mode: bool = False,
+    start_delay: float = 0.0,
+    warmup_steps: int = 0,
+    warmup_delay: float | None = None,
 ):
     """执行完整解法点击序列。"""
-    ctrl = ClickController(delay=delay, pause_after=pause_after)
+    ctrl = ClickController(
+        delay=delay,
+        pause_after=pause_after,
+        warmup_steps=warmup_steps,
+        warmup_delay=warmup_delay,
+    )
 
     if step_mode:
         ctrl.enable_step_mode()
@@ -302,6 +326,7 @@ def execute_solution(
     print("控制键：  p=暂停/继续  n=下一步  s=结束\n")
 
     try:
+        prepare_to_start(start_delay)
         for card_id in card_ids:
             win_x, win_y = ctrl.get_win_pos()
             x, y = card_id_to_coords(card_id, calib, map_data, win_x, win_y)
@@ -312,3 +337,22 @@ def execute_solution(
         print(f"\n已停止（完成 {ctrl.click_count}/{total} 步）")
     finally:
         ctrl.stop()
+
+
+def prepare_to_start(start_delay: float):
+    """自动点击前激活微信并给系统一点缓冲时间。"""
+    print("正在激活微信窗口，准备开始点击...")
+    bring_wechat_to_front()
+    time.sleep(0.3)
+
+    start_delay = float(start_delay)
+    if start_delay <= 0:
+        return
+
+    remaining = start_delay
+    while remaining > 0:
+        shown = int(remaining) if remaining.is_integer() else round(remaining, 1)
+        print(f"{shown} 秒后开始...")
+        sleep_for = min(1.0, remaining)
+        time.sleep(sleep_for)
+        remaining = max(0.0, remaining - sleep_for)

@@ -32,8 +32,52 @@ class OperationPool(object):
             result_list = list(self._main_zone)
             random.shuffle(result_list)
             return result_list
+        elif algorithm == "triple-greedy":
+            return self._sort_triple_greedy()
+        elif algorithm == "mrv":
+            return self._sort_mrv()
         else:
             return []
+
+    def _collect_main_zone_meta(self):
+        """返回 (detail_dict, type_groups)：cards in main_zone, type → [indices]."""
+        detail_dict = self._card_container.get_card_detail_dict(self._main_zone)
+        type_groups: dict = {}
+        for idx, detail in detail_dict.items():
+            type_groups.setdefault(detail.get_card_type(), []).append(idx)
+        return detail_dict, type_groups
+
+    def _sort_triple_greedy(self):
+        if not self._main_zone:
+            return []
+        detail_dict, type_groups = self._collect_main_zone_meta()
+
+        triples: list = []
+        # 拥有 ≥3 张可见的 type：把这些卡放到最前；多个三连时优先匹配数最大的
+        triple_types = sorted(
+            (t for t, g in type_groups.items() if len(g) >= 3),
+            key=lambda t: -len(type_groups[t]),
+        )
+        for t in triple_types:
+            group = sorted(type_groups[t], key=lambda i: -detail_dict[i].get_card_level())
+            triples.extend(group)
+
+        triple_set = set(triples)
+        rest = [i for i in self._main_zone if i not in triple_set]
+        rest.sort(key=lambda i: -detail_dict[i].get_card_level())
+        return triples + rest
+
+    def _sort_mrv(self):
+        if not self._main_zone:
+            return []
+        detail_dict, type_groups = self._collect_main_zone_meta()
+        type_count = {t: len(g) for t, g in type_groups.items()}
+        # 同 type 可见数多的优先（更接近凑齐三连），同档按层级从顶到底
+        return sorted(
+            self._main_zone,
+            key=lambda i: (-type_count[detail_dict[i].get_card_type()],
+                           -detail_dict[i].get_card_level()),
+        )
 
     def pick_card(self, card_index):
         self._pick_card_normal(card_index)

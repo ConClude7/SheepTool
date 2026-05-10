@@ -4,7 +4,7 @@ SheepTool — 羊了个羊自动化助手
 
 典型流程：
   1. 进入关卡后从抓包/Network 面板复制 API 响应 JSON
-  2. python main.py run                    （粘贴 JSON → 解析地图→校准→求解→点击）
+  2. python main.py run                    （粘贴 JSON → 解析地图→求解第二关→点击第一关→确认点击第二关）
 
 完整命令：
   calibrate               校准微信窗口中的牌局区域
@@ -12,7 +12,7 @@ SheepTool — 羊了个羊自动化助手
   run [选项]              主命令：输入 API JSON → 下载→解析→求解→点击
     --json  JSON字符串    直接传入 API 响应（省去交互粘贴）
     --file  FILE          从文件读取 API 响应
-    --level 1|2           运行第几关（默认 2）
+    --level 1|2           单关模式：运行第几关（默认 2；默认 run 会自动串两关）
     --delay SEC           点击间隔，默认 0.4s
     --pause-after N       每 N 步自动暂停
     --step                单步模式（每步按 n 确认）
@@ -35,6 +35,10 @@ KEYSTREAM_DIR = DATA_DIR / "keystreams"
 
 DEFAULT_CONFIG = {
     "click_delay": 0.4,
+    "first_click_delay": 0.0,
+    "start_delay": 3.0,
+    "warmup_steps": 5,
+    "warmup_click_delay": 0.35,
     "pause_after": 0,
     "algorithm":   "normal",
     "solver": {
@@ -51,7 +55,8 @@ DEFAULT_CONFIG = {
 }
 
 ALGORITHMS = ["normal", "random", "level-top", "level-bottom",
-              "index-ascending", "index-descending"]
+              "index-ascending", "index-descending",
+              "triple-greedy", "mrv"]
 
 
 def load_config() -> dict:
@@ -533,25 +538,51 @@ def _print_map_summary(maps: dict[int, dict]):
     print("└" + "─" * 49)
 
 
-def confirm_before_click(solution_steps: int, total_tiles: int) -> bool:
-    """在自动点击前请求用户确认；部分解默认更严格。"""
+def confirm_before_click(solution_steps: int, total_tiles: int) -> str:
+    """在自动点击前请求用户确认；返回 y/n/r 三种动作。"""
     is_partial = solution_steps < total_tiles
     try:
         if is_partial:
             answer = input(
                 f"当前解法是从第 0 步开始的最佳部分解（{solution_steps}/{total_tiles} 步），"
                 "只会点击到这个停点，后续可手动使用道具。"
-                "是否开始自动点击？[y/N] "
+                "是否开始自动点击？[y/n/r]（r=重新校准） "
             ).strip().lower()
-            return answer == "y"
+            return answer if answer in {"y", "n", "r"} else "n"
 
         answer = input(
             f"求解已完成（{solution_steps}/{total_tiles} 步），"
-            "是否开始自动点击？[y/N] "
+            "是否开始自动点击？[y/n/r]（r=重新校准） "
         ).strip().lower()
     except EOFError:
-        return False
-    return answer == "y"
+        return "n"
+    return answer if answer in {"y", "n", "r"} else "n"
+
+
+def prepare_click_calibration(
+    *,
+    label: str,
+    map_data: dict,
+    solution: list[str],
+    total_tiles: int,
+    preview_path: Path,
+) -> dict | None:
+    """确认自动点击；输入 r 时重新校准并重建点击预览。"""
+    from calibrate import ALIGNMENT_PREVIEW_FILE, load_calibration, run_calibration
+
+    calib = load_calibration()
+    while True:
+        action = confirm_before_click(len(solution), total_tiles)
+        if action == "y":
+            return calib
+        if action == "n":
+            return None
+
+        print(f"\n正在重新校准{label}牌区位置……")
+        run_calibration(map_data=map_data)
+        print(f"{label}地图预计点击点位预览图: {ALIGNMENT_PREVIEW_FILE}")
+        calib = load_calibration()
+        export_click_preview(label, calib, map_data, solution, preview_path)
 
 
 def confirm_preview_ready(prompt: str) -> bool:
@@ -562,11 +593,111 @@ def confirm_preview_ready(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
+def wait_for_next_level() -> bool:
+    """等待用户进入第二关后输入 n。"""
+    try:
+        answer = input("\n第一关点击完成后，请手动进入第二关；准备好后输入 n 生成第二关点击预览：").strip().lower()
+    except EOFError:
+        return False
+    return answer == "n"
+
+
+def _iter_level_cards(map_data: dict) -> list[dict]:
+    cards: list[dict] = []
+    for key in sorted((map_data.get("levelData") or {}).keys(), key=int):
+        cards.extend(map_data["levelData"][key])
+    return cards
+
+
+def build_first_level_click_sequence(map_data: dict) -> list[str]:
+    """第一关通常不用求解，直接按稳定顺序点完全部格子。"""
+    cards = _iter_level_cards(map_data)
+
+    def sort_key(card: dict) -> tuple[int, int, int, str]:
+        card_id = str(card.get("id", "0-0-0"))
+        parts = card_id.split("-")
+        try:
+            layer = int(parts[0])
+        except (ValueError, IndexError):
+            layer = int(card.get("layerNum", 0) or 0)
+        return (
+            -layer,
+            int(card.get("rowNum", 0) or 0),
+            int(card.get("rolNum", 0) or 0),
+            card_id,
+        )
+
+    return [str(card["id"]) for card in sorted(cards, key=sort_key) if card.get("id")]
+
+
+def save_solution_file(
+    *,
+    level: int,
+    md5: str,
+    algorithm: str,
+    solution: list[str],
+    total_tiles: int,
+    is_partial: bool,
+    mode: str,
+) -> Path:
+    out = DATA_DIR / "parsed" / f"solution_level{level}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump({
+            "level": level,
+            "md5": md5,
+            "algorithm": algorithm,
+            "mode": mode,
+            "is_partial": is_partial,
+            "total_tiles": total_tiles,
+            "steps": len(solution),
+            "solution": solution,
+        }, f, indent=2, ensure_ascii=False)
+    print(f"解法已保存: {out}")
+    return out
+
+
+def export_click_preview(label: str, calib: dict, map_data: dict, solution: list[str], output_path: Path):
+    from calibrate import export_solution_preview_from_current_window
+
+    try:
+        preview = export_solution_preview_from_current_window(
+            calib["grid_rel"],
+            map_data,
+            solution,
+            output_path=output_path,
+            highlight_count=10,
+        )
+        print(f"{label}点击预览图: {preview}")
+    except RuntimeError as e:
+        print(f"警告：无法生成{label}点击预览图：{e}")
+
+
 # ── run 命令 ──────────────────────────────────────────────────────────────────
 
 def cmd_run(args):
     cfg       = load_config()
     delay     = args.delay       if args.delay       is not None else cfg["click_delay"]
+    first_delay = (
+        args.first_delay
+        if args.first_delay is not None
+        else cfg.get("first_click_delay", delay)
+    )
+    start_delay = (
+        args.start_delay
+        if args.start_delay is not None
+        else cfg.get("start_delay", 3.0)
+    )
+    warmup_steps = (
+        args.warmup_steps
+        if args.warmup_steps is not None
+        else cfg.get("warmup_steps", 5)
+    )
+    warmup_delay = (
+        args.warmup_delay
+        if args.warmup_delay is not None
+        else cfg.get("warmup_click_delay", 0.35)
+    )
     pa        = args.pause_after if args.pause_after is not None else cfg["pause_after"]
     algorithm = args.algorithm   or cfg["algorithm"]
     level_idx = args.level - 1   # 用户传 1 或 2，转为 0-based
@@ -576,6 +707,7 @@ def cmd_run(args):
     from calibrate import (
         ALIGNMENT_PREVIEW_FILE,
         SOLUTION_PREVIEW_FILE,
+        DATA_DIR as CALIBRATE_DATA_DIR,
         export_solution_preview_from_current_window,
         load_calibration,
         run_calibration,
@@ -598,7 +730,159 @@ def cmd_run(args):
     maps = fetch_both_maps(api_data)
     _print_map_summary(maps)
 
-    # ── 目标关 + 校准点位预览 ──
+    # ── 单关模式：只有一张地图，或用户明确运行第一关时沿用旧流程 ──
+    if len(maps) < 2 or args.level == 1:
+        _run_single_level(
+            args=args,
+            api_data=api_data,
+            maps=maps,
+            cfg=cfg,
+            delay=delay,
+            pause_after=pa,
+            algorithm=algorithm,
+            level_idx=level_idx,
+            start_delay=start_delay,
+            warmup_steps=warmup_steps,
+            warmup_delay=warmup_delay,
+        )
+        return
+
+    # ── 默认两关流程：先求解第二关，再点击第一关，最后确认点击第二关 ──
+    first = maps[0]
+    target = maps[level_idx]
+    first_total_tiles = sum(len(v) for v in first.get("levelData", {}).values())
+    second_total_tiles = sum(len(v) for v in target.get("levelData", {}).values())
+
+    print(f"\n正在求解第 {level_idx+1} 关……")
+    solution = solve(target, cfg["solver"], algorithm)
+    is_partial = len(solution) < second_total_tiles
+
+    save_solution_file(
+        level=level_idx + 1,
+        md5=api_data["map_md5"][level_idx],
+        algorithm=algorithm,
+        solution=solution,
+        total_tiles=second_total_tiles,
+        is_partial=is_partial,
+        mode="solved",
+    )
+    if is_partial:
+        print(
+            f"提示：第二关当前为从第 0 步开始的部分解（{len(solution)}/{second_total_tiles} 步），"
+            "自动点击会停在这里，不会继续猜后续步骤。"
+        )
+
+    print("\n现在处理第一关。请保持微信窗口在第一关牌面。")
+    run_calibration(map_data=first)
+    print(f"第一关地图预计点击点位预览图: {ALIGNMENT_PREVIEW_FILE}")
+
+    calib = load_calibration()
+    first_clicks = build_first_level_click_sequence(first)
+    save_solution_file(
+        level=1,
+        md5=api_data["map_md5"][0],
+        algorithm="click-all",
+        solution=first_clicks,
+        total_tiles=first_total_tiles,
+        is_partial=len(first_clicks) < first_total_tiles,
+        mode="click_all",
+    )
+    export_click_preview(
+        "第一关",
+        calib,
+        first,
+        first_clicks,
+        CALIBRATE_DATA_DIR / "solution_preview_level1.png",
+    )
+
+    calib = prepare_click_calibration(
+        label="第一关",
+        map_data=first,
+        solution=first_clicks,
+        total_tiles=first_total_tiles,
+        preview_path=CALIBRATE_DATA_DIR / "solution_preview_level1.png",
+    )
+    if calib is None:
+        print("已取消第一关自动点击。")
+        return
+
+    execute_solution(
+        first_clicks,
+        map_data=first,
+        calib=calib,
+        delay=first_delay,
+        pause_after=pa,
+        step_mode=args.step,
+        start_delay=start_delay,
+        warmup_steps=warmup_steps,
+        warmup_delay=warmup_delay,
+    )
+
+    if not wait_for_next_level():
+        print("未进入第二关点击预览，已停止。")
+        return
+
+    print("\n正在重新校准第二关牌区位置……")
+    run_calibration(map_data=target)
+    print(f"第二关地图预计点击点位预览图: {ALIGNMENT_PREVIEW_FILE}")
+    calib = load_calibration()
+
+    export_click_preview(
+        "第二关",
+        calib,
+        target,
+        solution,
+        SOLUTION_PREVIEW_FILE,
+    )
+
+    calib = prepare_click_calibration(
+        label="第二关",
+        map_data=target,
+        solution=solution,
+        total_tiles=second_total_tiles,
+        preview_path=SOLUTION_PREVIEW_FILE,
+    )
+    if calib is None:
+        print("已取消第二关自动点击。")
+        return
+
+    execute_solution(
+        solution,
+        map_data=target,
+        calib=calib,
+        delay=delay,
+        pause_after=pa,
+        step_mode=args.step,
+        start_delay=start_delay,
+        warmup_steps=warmup_steps,
+        warmup_delay=warmup_delay,
+    )
+
+
+def _run_single_level(
+    *,
+    args,
+    api_data: dict,
+    maps: dict[int, dict],
+    cfg: dict,
+    delay: float,
+    pause_after: int,
+    algorithm: str,
+    level_idx: int,
+    start_delay: float,
+    warmup_steps: int,
+    warmup_delay: float | None,
+):
+    from solver  import solve
+    from clicker import execute_solution
+    from calibrate import (
+        ALIGNMENT_PREVIEW_FILE,
+        SOLUTION_PREVIEW_FILE,
+        export_solution_preview_from_current_window,
+        load_calibration,
+        run_calibration,
+    )
+
     target = maps[level_idx]
     total_tiles = sum(len(v) for v in target.get("levelData", {}).values())
 
@@ -609,25 +893,19 @@ def cmd_run(args):
         print("已取消求解。")
         return
 
-    # ── 求解目标关 ──
     print(f"\n正在求解第 {level_idx+1} 关……")
     solution = solve(target, cfg["solver"], algorithm)
     is_partial = len(solution) < total_tiles
 
-    # ── 保存解法 ──
-    out = DATA_DIR / "parsed" / f"solution_level{level_idx+1}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
-        json.dump({
-            "level": level_idx + 1,
-            "md5": api_data["map_md5"][level_idx],
-            "algorithm": algorithm,
-            "is_partial": is_partial,
-            "total_tiles": total_tiles,
-            "steps": len(solution),
-            "solution": solution,
-        }, f, indent=2, ensure_ascii=False)
-    print(f"解法已保存: {out}")
+    save_solution_file(
+        level=level_idx + 1,
+        md5=api_data["map_md5"][level_idx],
+        algorithm=algorithm,
+        solution=solution,
+        total_tiles=total_tiles,
+        is_partial=is_partial,
+        mode="solved",
+    )
     if is_partial:
         print(
             f"提示：当前为从第 0 步开始的部分解（{len(solution)}/{total_tiles} 步），"
@@ -647,8 +925,14 @@ def cmd_run(args):
     except RuntimeError as e:
         print(f"警告：无法生成前 10 步预览图：{e}")
 
-    # ── 执行点击 ──
-    if not confirm_before_click(len(solution), total_tiles):
+    calib = prepare_click_calibration(
+        label=f"第 {level_idx+1} 关",
+        map_data=target,
+        solution=solution,
+        total_tiles=total_tiles,
+        preview_path=SOLUTION_PREVIEW_FILE,
+    )
+    if calib is None:
         print("已取消自动点击。")
         return
 
@@ -657,8 +941,11 @@ def cmd_run(args):
         map_data=target,
         calib=calib,
         delay=delay,
-        pause_after=pa,
+        pause_after=pause_after,
         step_mode=args.step,
+        start_delay=start_delay,
+        warmup_steps=warmup_steps,
+        warmup_delay=warmup_delay,
     )
 
 
@@ -689,11 +976,14 @@ def build_parser() -> argparse.ArgumentParser:
   # 首次校准（把微信调到游戏界面再运行）
   python main.py calibrate
 
-  # 将 JSON 保存到文件再读取（match_data 含特殊字符时推荐）
-  python main.py run --file api_response.json --level 1
+  # 默认串两关：粘贴/读取数据后先求解第二关，再点击第一关，最后确认点击第二关
+  python main.py run --file api_response.json
 
   # 交互式粘贴，粘贴完成后按 Ctrl+D
   python main.py run
+
+  # 单独跑第一关时使用单关旧流程
+  python main.py run --file api_response.json --level 1
 
   # 直接传入 JSON 字符串
   python main.py run --json '{"err_code":0,"data":{...}}'
@@ -713,7 +1003,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("preview", help="生成当前窗口的对齐预览图")
 
     # run
-    p = sub.add_parser("run", help="输入 API JSON → 下载→解析→求解→点击")
+    p = sub.add_parser("run", help="输入 API JSON → 下载→解析→求解第二关→点击两关")
     src = p.add_mutually_exclusive_group()
     src.add_argument("--json", metavar="JSON",
                      help="直接传入 API 响应 JSON 字符串")
@@ -722,9 +1012,17 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--daily", action="store_true",
                      help="每日关卡交互模式：依次粘贴 map_info_ex Response 和 seed Request")
     p.add_argument("--level", type=int, choices=[1, 2], default=2,
-                   help="运行第几关（1 或 2，默认 2）")
+                   help="运行第几关。默认 2 会串联第一关点击和第二关求解；1 使用单关流程")
     p.add_argument("--delay", type=float, metavar="SEC",
                    help="点击间隔秒数（默认 0.4）")
+    p.add_argument("--first-delay", type=float, dest="first_delay", metavar="SEC",
+                   help="第一关点击间隔秒数，单独配置，可设为 0 或负数表示尽量不等待")
+    p.add_argument("--start-delay", type=float, dest="start_delay", metavar="SEC",
+                   help="确认开始后倒计时秒数，期间会先激活微信窗口（默认 3）")
+    p.add_argument("--warmup-steps", type=int, dest="warmup_steps", metavar="N",
+                   help="开头使用慢速保护的步数（默认 5）")
+    p.add_argument("--warmup-delay", type=float, dest="warmup_delay", metavar="SEC",
+                   help="开头保护步的最小点击间隔秒数（默认 0.35）")
     p.add_argument("--pause-after", type=int, dest="pause_after", metavar="N",
                    help="每 N 步自动暂停")
     p.add_argument("--step", action="store_true",
