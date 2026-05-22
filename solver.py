@@ -152,9 +152,9 @@ def _worker_fn_deterministic(args: tuple) -> tuple:
 # ── 确定性算法列表 ────────────────────────────────────────────────────────────
 
 _DETERMINISTIC_ALGORITHMS = [
-    # "mrv",
+    "mrv",
     "level-top",
-    # "triple-greedy",
+    "triple-greedy",
     "index-descending",
 ]
 

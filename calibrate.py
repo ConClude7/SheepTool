@@ -592,7 +592,10 @@ def _expand_vertical_edge(
     return edge
 
 
-def detect_grid_region(screenshot: Image.Image) -> tuple[int, int, int, int] | None:
+def detect_grid_region(
+    screenshot: Image.Image,
+    map_data: dict | None = None,
+) -> tuple[int, int, int, int] | None:
     """
     从游戏截图中自动识别牌区边界。
     思路：
@@ -673,6 +676,15 @@ def detect_grid_region(screenshot: Image.Image) -> tuple[int, int, int, int] | N
         return None
 
     left, right = max(merged_cols, key=lambda interval: interval[1] - interval[0])
+    if map_data is not None and len(merged_cols) > 1:
+        cards = _iter_map_cards(map_data)
+        unique_rols = {int(card.get("rolNum", 0)) for card in cards}
+        # 第一关这类稀疏布局，列统计常会被切成几段；
+        # 只取“最宽的一段”会误把整盘缩成最左一列。
+        sparse_layout = len(cards) <= 36 or len(unique_rols) <= 4
+        if sparse_layout:
+            left = merged_cols[0][0]
+            right = merged_cols[-1][1]
 
     edge_threshold = max(80, int((right - left + 1) * 0.22))
     top = _expand_vertical_edge(
@@ -706,7 +718,7 @@ def detect_grid_region(screenshot: Image.Image) -> tuple[int, int, int, int] | N
 
 
 def try_auto_calibration(window_info: dict, screenshot: Image.Image, map_data: dict | None = None) -> bool:
-    region = detect_grid_region(screenshot)
+    region = detect_grid_region(screenshot, map_data=map_data)
     if not region:
         return False
 

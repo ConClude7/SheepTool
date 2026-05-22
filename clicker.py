@@ -119,7 +119,7 @@ class ClickController:
 
     def __init__(
         self,
-        delay: float = 0.4,
+        delay: float = 0.2,
         pause_after: int = 0,
         warmup_steps: int = 0,
         warmup_delay: float | None = None,
