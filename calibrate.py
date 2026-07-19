@@ -3,6 +3,8 @@
 校准工具：截图微信窗口，让用户框选牌局区域，保存偏移量。
 运行方式：python main.py calibrate
 """
+from __future__ import annotations
+
 import json
 import os
 import subprocess

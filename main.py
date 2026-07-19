@@ -21,6 +21,8 @@ SheepTool — 羊了个羊自动化助手
 求解期间快捷键：  s 停止求解并采用当前最佳部分解
 点击期间快捷键：  p 暂停/继续   n 下一步   s 结束
 """
+from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -162,16 +164,22 @@ def _paste_one_line(title: str) -> str:
         value = input("> ").strip()
     except EOFError:
         return ""
-    path = Path(value).expanduser()
-    if path.exists() and path.is_file():
-        return path.read_text(encoding="utf-8", errors="replace").strip()
+    try:
+        path = Path(value).expanduser()
+        if path.exists() and path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        pass
     return value
 
 
 def _as_existing_dir(value: str) -> Path | None:
-    path = Path(value).expanduser()
-    if path.exists() and path.is_dir():
-        return path
+    try:
+        path = Path(value).expanduser()
+        if path.exists() and path.is_dir():
+            return path
+    except OSError:
+        pass
     return None
 
 

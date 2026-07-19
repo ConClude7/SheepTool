@@ -3,6 +3,8 @@
 点击执行器：将解法卡牌 ID 转换为屏幕坐标并逐一点击。
 支持暂停/继续、单步、结束控制。
 """
+from __future__ import annotations
+
 import json
 import random
 import sys
